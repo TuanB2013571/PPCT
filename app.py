@@ -928,7 +928,7 @@ if st.session_state.get("excel_output"):
 
     # Tạo tên file tự động.
     file_name = (
-        f"PPCT_mon_{mon}lop_{lop}.xlsx"
+        f"PPCT_môn_{mon}_lớp_{lop}.xlsx"
     )
 
     st.download_button(
