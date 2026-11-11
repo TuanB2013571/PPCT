@@ -404,31 +404,40 @@ def read_word(file_bytes):
 
 def detect_period_standard(weekly_data):
     """
-    Lấy số tiết lớn nhất trong các tuần học bình thường.
-    Không lấy tuần ôn tập/đánh giá để suy ra định mức.
-    Cách này đáp ứng trường hợp tuần ôn tập không ghi số tiết:
-    lấy định mức tối đa từ các tuần học khác.
+    Xác định định mức bằng số tiết xuất hiện phổ biến nhất (mode),
+    KHÔNG lấy tuần có số tiết lớn nhất làm chuẩn.
+
+    Chỉ dùng các tuần học bình thường:
+    - Có bài học và số tiết rõ ràng.
+    - Không có dòng ôn tập/kiểm tra riêng.
+    - Không có nội dung thiếu số tiết.
+
+    Nếu có nhiều mức cùng xuất hiện nhiều nhất, không tự đoán định mức
+    mà báo lỗi để người dùng kiểm tra dữ liệu Word.
     """
-    normal_week_totals = []
+    normal_week_totals = {}
 
     for week, entries in weekly_data.items():
         lessons = [
             item for item in entries
             if item["type"] == "lesson"
-            and item["periods"] is not None
         ]
         reviews = [
             item for item in entries
             if item["type"] == "review"
         ]
 
-        # Chỉ dùng tuần không có dòng ôn tập riêng.
+        # Tuần có dòng ôn tập riêng không dùng để suy ra định mức.
         if not lessons or reviews:
+            continue
+
+        # Chỉ lấy tuần có đầy đủ số tiết của tất cả bài học.
+        if any(item["periods"] is None for item in lessons):
             continue
 
         total = sum(item["periods"] for item in lessons)
         if total > 0:
-            normal_week_totals.append(total)
+            normal_week_totals[week] = total
 
     if not normal_week_totals:
         raise ValueError(
@@ -437,8 +446,26 @@ def detect_period_standard(weekly_data):
             "và số tiết đầy đủ."
         )
 
-    # Định mức là số tiết tối đa trong các tuần học bình thường.
-    return max(normal_week_totals)
+    frequency = Counter(normal_week_totals.values())
+    highest_frequency = max(frequency.values())
+    most_common_totals = sorted(
+        total for total, count in frequency.items()
+        if count == highest_frequency
+    )
+
+    # Nếu nhiều mức đồng hạng, không lấy mức lớn nhất làm chuẩn.
+    if len(most_common_totals) > 1:
+        details = ", ".join(
+            f"{total} tiết ({frequency[total]} tuần)"
+            for total in most_common_totals
+        )
+        raise ValueError(
+            "Không thể tự xác định định mức số tiết/tuần vì có nhiều "
+            f"mức xuất hiện ngang nhau: {details}. "
+            "Vui lòng kiểm tra lại bảng Word."
+        )
+
+    return most_common_totals[0]
 
 
 # =====================================================
@@ -446,98 +473,102 @@ def detect_period_standard(weekly_data):
 # =====================================================
 
 def distribute_lessons(weekly_data):
+    """Phân phối tiết và báo lỗi cụ thể theo từng tuần, không hiện cảnh báo tự phân bổ."""
     standard = detect_period_standard(weekly_data)
 
     result = {}
-    warnings = []
     errors = []
 
-    # Chỉ xử lý những tuần thật sự có trong Word, không báo lỗi
-    # các tuần bị khuyết số (nghỉ/lược bỏ trong chương trình).
     for week in sorted(weekly_data):
         entries = [item.copy() for item in weekly_data[week]]
-
-        lessons = [
-            item for item in entries
-            if item["type"] == "lesson"
-        ]
-        reviews = [
-            item for item in entries
-            if item["type"] == "review"
-        ]
-
         if not entries:
             continue
 
-        missing = [
-            item for item in entries
-            if item["periods"] is None
-        ]
+        missing = [item for item in entries if item["periods"] is None]
+        known_total = sum(item["periods"] or 0 for item in entries)
 
-        known_total = sum(
-            item["periods"] or 0
-            for item in entries
-        )
-
-        # Nếu tuần chỉ có một dòng ôn tập không ghi số tiết,
-        # lặp nguyên tên ôn tập đủ định mức.
-        if reviews and not lessons:
-            if len(missing) == 1:
-                missing[0]["periods"] = standard
-            elif len(missing) > 1:
-                errors.append(
-                    f"Tuần {week}: có nhiều dòng ôn tập không ghi số tiết; "
-                    "không thể tự chia số tiết cho từng dòng."
-                )
-                continue
-
-        # Nếu tuần vừa có bài học vừa có ôn tập, dòng ôn tập thiếu
-        # số tiết sẽ nhận phần còn lại để tổng tuần bằng định mức.
-        elif missing:
-            if len(missing) > 1:
-                errors.append(
-                    f"Tuần {week}: có {len(missing)} nội dung thiếu số tiết. "
-                    "Không thể xác định chính xác số tiết từng nội dung."
-                )
-                continue
-
+        # Một nội dung chưa ghi số tiết có thể nhận phần tiết còn thiếu.
+        # Việc này được thực hiện âm thầm, không tạo cảnh báo riêng.
+        if len(missing) == 1:
             remaining = standard - known_total
-            if remaining <= 0:
-                errors.append(
-                    f"Tuần {week}: nội dung '{missing[0]['title']}' "
-                    "không ghi số tiết nhưng tuần không còn tiết trống."
-                )
-                continue
-
-            missing[0]["periods"] = remaining
-            warnings.append(
-                f"Tuần {week}: nội dung '{missing[0]['title']}' "
-                f"được phân bổ {remaining} tiết còn thiếu."
-            )
-
-        total = sum(
-            item["periods"] or 0
-            for item in entries
-        )
-
-        if total != standard:
+            if remaining > 0:
+                missing[0]["periods"] = remaining
+            else:
+                if known_total > standard:
+                    errors.append(
+                        f"Tuần {week}: nội dung '{missing[0]['title']}' chưa ghi số tiết "
+                        f"và không còn tiết để phân bổ. Các nội dung đã ghi có {known_total} tiết, "
+                        f"vượt định mức {standard} tiết."
+                    )
+                else:
+                    errors.append(
+                        f"Tuần {week}: nội dung '{missing[0]['title']}' chưa ghi số tiết; "
+                        f"các nội dung còn lại đã đủ {standard}/{standard} tiết, "
+                        "nên không còn tiết để phân bổ cho nội dung này."
+                    )
+                # Vẫn kiểm tra và báo các tiết thừa đã ghi (nếu có).
+        elif len(missing) > 1:
+            names = "; ".join(f"'{item['title']}'" for item in missing)
             errors.append(
-                f"Tuần {week}: tổng số tiết là {total}, "
-                f"không khớp định mức tối đa {standard} tiết/tuần."
+                f"Tuần {week}: có {len(missing)} nội dung chưa ghi số tiết: {names}. "
+                "Không thể xác định chính xác số tiết cho từng nội dung."
             )
+
+        total = sum(item["periods"] or 0 for item in entries)
+
+        if total > standard:
+            excess = total - standard
+            details = []
+            running = 0
+            for item in entries:
+                count = item["periods"] or 0
+                before = running
+                running += count
+                extra_here = max(0, running - standard) - max(0, before - standard)
+                if extra_here > 0:
+                    details.append(
+                        f"'{item['title']}' (phần vượt {extra_here} tiết; nội dung ghi {count} tiết)"
+                    )
+
+            detail_text = "; ".join(details) if details else "không xác định được dòng gây thừa"
+            errors.append(
+                f"Tuần {week}: tổng cộng {total}/{standard} tiết, THỪA {excess} tiết. "
+                f"Phần vượt nằm ở: {detail_text}."
+            )
+            continue
+
+        if total < standard:
+            deficit = standard - total
+            if missing:
+                missing_names = "; ".join(f"'{item['title']}'" for item in missing)
+                reason = f"Nội dung chưa ghi số tiết: {missing_names}."
+            else:
+                breakdown = "; ".join(
+                    f"'{item['title']}' ({item['periods']} tiết)"
+                    for item in entries
+                )
+                reason = f"Các nội dung đã ghi: {breakdown}."
+
+            errors.append(
+                f"Tuần {week}: tổng cộng {total}/{standard} tiết, THIẾU {deficit} tiết. "
+                f"{reason}"
+            )
+            continue
+
+        # Chỉ đưa tuần hợp lệ vào kết quả xuất Excel.
+        if any(item["periods"] is None for item in entries):
             continue
 
         expanded = []
         for item in entries:
             count = item["periods"] or 0
             if count > 0:
-                # Giữ nguyên tên đầy đủ của nội dung, không thay bằng chữ
-                # 'Ôn tập' chung chung.
                 expanded.extend([item["title"]] * count)
 
         result[week] = expanded
 
-    return standard, result, warnings, errors
+    # Giữ cấu trúc 4 giá trị để tương thích với phần giao diện hiện tại.
+    return standard, result, [], errors
 
 
 # =====================================================
@@ -850,7 +881,7 @@ if st.button(
 
             st.subheader("Kết quả kiểm tra")
             st.write(
-                f"Định mức tự nhận diện: **{standard} tiết/tuần**"
+                f"Định mức phổ biến tự nhận diện: **{standard} tiết/tuần**"
             )
 
             with st.expander(
@@ -876,14 +907,9 @@ if st.button(
                         f"Kết quả phân phối: {len(distributed)} tiết"
                     )
 
-            if warnings:
-                st.warning("Có nội dung được tự phân bổ, vui lòng đối chiếu:")
-                for warning in warnings:
-                    st.write("⚠️ " + warning)
-
             if errors:
                 st.error(
-                    "Chưa thể xuất Excel vì có tuần không đủ số tiết."
+                    "Chưa thể xuất Excel vì có tuần thừa hoặc thiếu số tiết so với định mức."
                 )
                 for error in errors:
                     st.write("❌ " + error)
@@ -928,7 +954,7 @@ if st.session_state.get("excel_output"):
 
     # Tạo tên file tự động.
     file_name = (
-        f"PPCT_môn_{mon}_lớp_{lop}.xlsx"
+        f"PPCT_mon_{mon}lop_{lop}.xlsx"
     )
 
     st.download_button(
